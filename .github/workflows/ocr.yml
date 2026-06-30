@@ -1,0 +1,174 @@
+name: OCR archive → Pagefind index
+
+# Manual trigger. Click "Run workflow" in the Actions tab.
+# Re-run as many times as needed: --resume + cache means each pass continues
+# where the last one stopped, and finished shards exit in seconds.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SHARDS: "20"            # keep in sync with the matrix list below
+  TIME_BUDGET: "18000"    # 5h: self-stop before the 6h hard job cap
+  WORKERS: "4"
+
+jobs:
+  # ---- 1) OCR, split across 20 parallel runners ----------------------------
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # under GitHub's 6h (360m) hard cap
+    strategy:
+      fail-fast: false     # one shard failing must not cancel the others
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tesseract + PyMuPDF
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tesseract-ocr
+          pip install --quiet pymupdf
+
+      # Pull this shard's partial output from the most recent run.
+      # The key is unique per run (immutable cache), restore-keys grabs the latest prefix match.
+      - name: Restore partial OCR for this shard
+        uses: actions/cache@v4
+        with:
+          path: shard-${{ matrix.shard }}.jsonl
+          key: ocr-v1-shard-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: |
+            ocr-v1-shard-${{ matrix.shard }}-
+
+      - name: OCR this shard
+        run: |
+          python ocr_pipeline.py \
+            --keys full_keys.json \
+            --out "shard-${{ matrix.shard }}.jsonl" \
+            --shards "${SHARDS}" \
+            --shard "${{ matrix.shard }}" \
+            --workers "${WORKERS}" \
+            --resume \
+            --time-budget "${TIME_BUDGET}"
+
+      - name: Shard progress report
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          shard = os.environ["SHARD"]
+          f = f"shard-{shard}.jsonl"
+          keys, pages = set(), 0
+          if os.path.exists(f):
+              for line in open(f):
+                  line = line.strip()
+                  if not line: continue
+                  try: r = json.loads(line)
+                  except Exception: continue
+                  pages += 1
+                  if r.get("key"): keys.add(r["key"])
+          # this shard's total assigned docs = every Nth key
+          all_keys = json.load(open("full_keys.json"))
+          n = int(os.environ.get("SHARDS", "20"))
+          assigned = len([k for i, k in enumerate(all_keys) if i % n == int(shard)])
+          done = len(keys)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              pct = (100*done/assigned) if assigned else 0
+              s.write(f"### Shard {shard}: {done}/{assigned} docs ({pct:.0f}%), {pages:,} pages\n")
+          print(f"[shard {shard}] {done}/{assigned} docs done, {pages} pages, {assigned-done} remaining")
+          PY
+
+      - name: Upload this shard's records
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-${{ matrix.shard }}.jsonl
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---- 2) Merge shards, build the Pagefind index, push to S3 ---------------
+  build-index:
+    needs: ocr
+    if: ${{ always() }}      # build even if some shards stopped early; partial index still works
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all shard records
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+          pattern: shard-*
+          merge-multiple: true
+
+      - name: Combine into records.jsonl
+        run: |
+          cat shards/shard-*.jsonl > records.jsonl
+          echo "Total page records: $(wc -l < records.jsonl)"
+
+      - name: Overall progress report
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          keys, pages, papers = set(), 0, set()
+          if os.path.exists("records.jsonl"):
+              for line in open("records.jsonl"):
+                  line = line.strip()
+                  if not line: continue
+                  try: r = json.loads(line)
+                  except Exception: continue
+                  pages += 1
+                  if r.get("key"): keys.add(r["key"])
+                  m = r.get("meta") or {}
+                  if m.get("paper"): papers.add(m["paper"])
+          total = len(json.load(open("full_keys.json")))
+          done = len(keys)
+          pct = (100*done/total) if total else 0
+          bars = int(pct // 5)
+          bar = "█"*bars + "░"*(20-bars)
+          out = (
+              "## 📰 Archive OCR progress\n\n"
+              f"`{bar}`  **{pct:.1f}%**\n\n"
+              f"| Metric | Count |\n|---|---|\n"
+              f"| Documents OCR'd | **{done:,}** / {total:,} |\n"
+              f"| Documents remaining | {total-done:,} |\n"
+              f"| Pages indexed | {pages:,} |\n"
+              f"| Distinct papers | {len(papers):,} |\n\n"
+          )
+          out += ("✅ **Archive fully OCR'd.**\n" if done >= total
+                  else "⏳ Re-run the workflow to continue the remaining documents.\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(out)
+          print(f"PROGRESS: {done}/{total} docs ({pct:.1f}%), {pages} pages")
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Pagefind index
+        run: |
+          npm ci
+          node build_index.mjs records.jsonl pagefind
+
+      - name: Sync index to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws s3 sync pagefind/ s3://archives.minsterhistoricalsociety.com/pagefind/ \
+            --delete \
+            --no-progress
+          echo "Index live at https://s3.amazonaws.com/archives.minsterhistoricalsociety.com/pagefind/"

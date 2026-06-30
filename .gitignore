@@ -1,0 +1,17 @@
+# Node
+node_modules/
+
+# Pagefind build output (rebuilt in CI, pushed to S3 — never committed)
+pagefind/
+demo/pagefind/
+
+# OCR output (generated in CI; can be huge)
+*.jsonl
+records.jsonl
+
+# Local test/scratch artifacts
+sample.pdf
+page0.png
+page0_txt.txt
+ocr.log
+.DS_Store
