@@ -157,22 +157,25 @@ jobs:
         with:
           node-version: "20"
 
-      # Indexing ~86k pages of OCR text is memory-heavy; add generous swap on the
-      # big /mnt disk so the Pagefind build can't get OOM-killed on the free runner.
+      # The Pagefind Rust indexer holds the whole index in memory during writeFiles;
+      # for ~97k newspaper pages that far exceeds 16 GB RAM. Give it a large swap file
+      # on the big /mnt disk (~70 GB free) so it can spill instead of being OOM-killed.
       - name: Add swap space
         run: |
-          sudo fallocate -l 12G /mnt/swapfile
+          sudo fallocate -l 45G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
           free -h
 
       - name: Build Pagefind index
-        env:
-          NODE_OPTIONS: "--max-old-space-size=12288"
         run: |
           npm ci
+          # background memory monitor so we can see the real peak during writeFiles
+          ( while true; do echo "[mem $(date +%T)] $(free -m | awk '/Mem:/{printf "used %sMB ", $3} /Swap:/{printf "swap %sMB", $3}')"; sleep 15; done ) &
+          MON=$!
           node build_index.mjs records.jsonl pagefind
+          kill $MON 2>/dev/null || true
           echo "Index size:"; du -sh pagefind
 
       - name: Sync index to S3
