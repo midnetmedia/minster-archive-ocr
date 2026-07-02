@@ -39,8 +39,13 @@ for await (const line of rl) {
     sort: { date: m.sortkey, page: String(r.page).padStart(3, "0") },
   });
   n++;
+  if (n % 5000 === 0) {
+    const rss = Math.round(process.memoryUsage().rss / 1048576);
+    console.log(`  added ${n} pages… (node rss ${rss} MB)`);
+  }
 }
 
+console.log(`all ${n} pages added; writing index files…`);
 await index.writeFiles({ outputPath: OUT });
 console.log(`indexed ${n} pages (${withText} with usable OCR text) -> ${OUT}`);
 process.exit(0);

@@ -157,10 +157,23 @@ jobs:
         with:
           node-version: "20"
 
+      # Indexing ~86k pages of OCR text is memory-heavy; add generous swap on the
+      # big /mnt disk so the Pagefind build can't get OOM-killed on the free runner.
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
       - name: Build Pagefind index
+        env:
+          NODE_OPTIONS: "--max-old-space-size=12288"
         run: |
           npm ci
           node build_index.mjs records.jsonl pagefind
+          echo "Index size:"; du -sh pagefind
 
       - name: Sync index to S3
         env:
